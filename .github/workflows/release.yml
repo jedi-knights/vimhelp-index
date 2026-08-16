@@ -1,0 +1,68 @@
+name: Release
+
+# Triggered after the CI workflow completes on main, mirroring the
+# plug-audit / neospec release.yml trigger topology. This gates the
+# release-PR open against a successful build — no point opening a
+# version-bump PR if the code that would ship it fails CI. Also allows
+# manual invocation for out-of-band re-runs.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+# Never cancel a release mid-flight — a partial run can leave the
+# release PR or tag in an inconsistent state that requires manual
+# cleanup.
+concurrency:
+  group: release-plz
+  cancel-in-progress: false
+
+# release-plz opens/updates a PR and (later) creates tags + GitHub
+# Releases; both writes need explicit permission at the job level
+# because the workflow-level default is read-only.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-plz:
+    name: release-plz
+    runs-on: ubuntu-latest
+    # Only run when the upstream ci run succeeded. workflow_dispatch is
+    # allowed unconditionally so a manual dispatch can force a re-check
+    # even if the last ci was red.
+    if: |
+      github.event_name == 'workflow_dispatch'
+      || github.event.workflow_run.conclusion == 'success'
+    steps:
+      # `fetch-depth: 0` so release-plz sees full commit history when
+      # computing the next semver bump from Conventional Commits.
+      # `token: GH_TOKEN` is an org-level PAT acting as an admin — the
+      # default `GITHUB_TOKEN` is blocked by the "GitHub Actions is not
+      # permitted to create or approve pull requests" repo setting, so
+      # release-plz's PR creation fails with 403. GH_TOKEN sidesteps
+      # this and also bypasses the main-branch PR ruleset if release-plz
+      # ever needs to push directly.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: install toolchain
+        run: rustup show
+
+      - name: cache
+        uses: Swatinem/rust-cache@v2
+
+      # By default the action runs both `release-pr` and `release`.
+      # `release-pr` opens/updates the rolling release PR that bumps
+      # Cargo.toml + updates CHANGELOG.md. `release` creates a git tag
+      # + GitHub Release when a bump commit is present on main. Neither
+      # publishes to crates.io — `publish = false` in release-plz.toml.
+      - name: release-plz
+        uses: release-plz/action@v0.5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}

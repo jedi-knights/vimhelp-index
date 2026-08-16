@@ -1,0 +1,85 @@
+name: jk-vimhelp-index
+description: Install the vimhelp-index binary and put it on PATH. Callers invoke `vimhelp-index build` / `vimhelp-index search` in their own steps.
+author: jedi-knights
+
+branding:
+  icon: search
+  color: green
+
+# Design note: install-only. vimhelp-index has two subcommands with
+# different flag sets (`build` and `search`), typically invoked in
+# different jobs and different orders per workflow. Baking a subcommand
+# router into this action's inputs surface would be strictly worse than
+# letting callers write their own `run:` steps against a binary on PATH.
+# Matches the convention used by dtolnay/rust-toolchain,
+# actions/setup-node, and cargo-dist's own action.
+
+inputs:
+  version:
+    description: |
+      Override the vimhelp-index version to install (e.g. "v0.2.0").
+      Defaults to the tag this action was called at, or the latest
+      release for branch/major-tag refs.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Download vimhelp-index
+      shell: bash
+      env:
+        ACTION_REF: ${{ github.action_ref }}
+        VERSION_OVERRIDE: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        # Map runner OS + architecture to a cargo-dist target triple.
+        OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+        ARCH="$(uname -m)"
+
+        case "$OS-$ARCH" in
+          linux-x86_64)         TRIPLE="x86_64-unknown-linux-gnu" ;;
+          linux-aarch64|linux-arm64) TRIPLE="aarch64-unknown-linux-gnu" ;;
+          darwin-x86_64)        TRIPLE="x86_64-apple-darwin" ;;
+          darwin-arm64)         TRIPLE="aarch64-apple-darwin" ;;
+          *)
+            echo "::error::Unsupported runner OS/architecture: $OS/$ARCH — Windows runners should install vimhelp-index via the PowerShell installer at https://github.com/jedi-knights/vimhelp-index/releases"
+            exit 1
+            ;;
+        esac
+
+        # Resolve version:
+        # 1. Explicit `version:` input wins.
+        # 2. `github.action_ref` when it looks like a semver tag (v1.2.3).
+        # 3. Fall back to the latest published release.
+        VERSION="${VERSION_OVERRIDE:-}"
+        if [ -z "$VERSION" ] && [[ "${ACTION_REF:-}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          VERSION="$ACTION_REF"
+        fi
+        if [ -z "$VERSION" ]; then
+          VERSION="$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/jedi-knights/vimhelp-index/releases/latest \
+            | grep '"tag_name"' | head -1 | cut -d'"' -f4)"
+        fi
+        if [ -z "$VERSION" ]; then
+          echo "::error::Failed to resolve vimhelp-index version"
+          exit 1
+        fi
+
+        # cargo-dist archive format: vimhelp-index-<triple>.tar.xz
+        # Archives contain a single file at the root (the binary), so
+        # extracting straight into $RUNNER_TEMP puts it directly on PATH.
+        ARCHIVE="vimhelp-index-${TRIPLE}.tar.xz"
+        URL="https://github.com/jedi-knights/vimhelp-index/releases/download/${VERSION}/${ARCHIVE}"
+
+        echo "Downloading vimhelp-index ${VERSION} (${TRIPLE})"
+        curl -fsSL "$URL" -o "$RUNNER_TEMP/${ARCHIVE}"
+        tar -xJf "$RUNNER_TEMP/${ARCHIVE}" -C "$RUNNER_TEMP"
+        chmod +x "$RUNNER_TEMP/vimhelp-index"
+        echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+        # Sanity check — surfaces a broken install as a clear line in the
+        # step log rather than as a downstream "command not found."
+        "$RUNNER_TEMP/vimhelp-index" --version
