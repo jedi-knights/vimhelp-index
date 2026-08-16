@@ -17,7 +17,7 @@
 //! src/-position unit test runs against a stale `target/debug/` binary
 //! because the harness doesn't wire cargo_bin to a rebuild trigger.
 
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -34,14 +34,15 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Build a full-text index from a glob of vimdoc files.
+    /// Build a full-text index from one or more globs of vimdoc files.
     Build {
         /// Glob resolving to one or more `doc/*.txt` files.
-        /// Examples:
-        ///   --docs='/path/to/plugin/**/doc/*.txt'
-        ///   --docs='$VIMRUNTIME/doc/*.txt'
-        #[arg(long, value_name = "GLOB")]
-        docs: String,
+        /// Repeatable to union multiple globs:
+        ///   --docs='$VIMRUNTIME/doc/*.txt' --docs='$HOME/.local/share/nvim/lazy/*/doc/*.txt'
+        /// Individual globs that match zero files are silently ignored;
+        /// only an empty UNION across all --docs flags is an error.
+        #[arg(long, value_name = "GLOB", action = ArgAction::Append, required = true)]
+        docs: Vec<String>,
         /// Directory to write the index into. Created if missing.
         #[arg(long, value_name = "DIR")]
         out: PathBuf,
@@ -78,6 +79,7 @@ pub fn run() -> anyhow::Result<()> {
             out,
             incremental,
         } => build::run(&docs, &out, incremental),
+        // ^^ docs is Vec<String>; build::run takes &[String].
         Command::Search {
             index,
             limit,
