@@ -20,6 +20,10 @@ serde_json = "1"
 glob = "0.3"
 # regex — vimdoc tag extraction: *name* with a bounded character class
 regex = "1"
+# tantivy — full-text index engine. Chosen over bleve/lucene ports because
+# it's Rust-native (no FFI), mature, and the reference for full-text search
+# in the Rust ecosystem. Adds ~60-90s to first CI compile; cache handles it.
+tantivy = "0.22"
 
 [dev-dependencies]
 # snapshot tests for the parser output shape
