@@ -225,3 +225,207 @@ fn search_against_missing_index_dir_fails_with_actionable_error() {
         .failure()
         .stderr(predicate::str::contains("tantivy"));
 }
+
+// -- incremental build --------------------------------------------------
+
+/// Advance a file's mtime by 2 seconds so incremental sees a change even on
+/// low-precision filesystems (HFS+ rounds to whole seconds).
+fn touch_file(path: &std::path::Path) {
+    let now = std::time::SystemTime::now();
+    let future = now + std::time::Duration::from_secs(2);
+    filetime::set_file_mtime(path, filetime::FileTime::from_system_time(future)).unwrap();
+}
+
+#[test]
+fn incremental_without_prior_manifest_falls_back_to_full_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs_dir = tmp.path().join("docs");
+    std::fs::create_dir(&docs_dir).unwrap();
+    write_fixture(
+        &docs_dir,
+        "a.txt",
+        "*a.txt* file\n\n==============================================================================\nSection *a-sec*\n\nalpha content\n",
+    );
+
+    let idx = tmp.path().join("idx");
+    let pattern = format!("{}/*.txt", docs_dir.display());
+
+    bin()
+        .args(["build", "--incremental", "--docs", &pattern, "--out"])
+        .arg(&idx)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no prior manifest"))
+        .stdout(predicate::str::contains("Indexed"));
+
+    // Manifest written after the fallback full build.
+    assert!(idx.join("vimhelp-manifest.json").exists());
+}
+
+#[test]
+fn incremental_with_unchanged_files_reports_no_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs_dir = tmp.path().join("docs");
+    std::fs::create_dir(&docs_dir).unwrap();
+    write_fixture(
+        &docs_dir,
+        "a.txt",
+        "*a.txt* file\n\n==============================================================================\nS *a-sec*\n\nalpha\n",
+    );
+    let idx = tmp.path().join("idx");
+    let pattern = format!("{}/*.txt", docs_dir.display());
+
+    // First build primes the manifest.
+    bin()
+        .args(["build", "--docs", &pattern, "--out"])
+        .arg(&idx)
+        .assert()
+        .success();
+
+    // Second run with --incremental sees the same files → no changes.
+    bin()
+        .args(["build", "--incremental", "--docs", &pattern, "--out"])
+        .arg(&idx)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no changes"))
+        .stdout(predicate::str::contains("1 unchanged"));
+}
+
+#[test]
+fn incremental_detects_touched_file_as_changed_and_reindexes_body() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs_dir = tmp.path().join("docs");
+    std::fs::create_dir(&docs_dir).unwrap();
+    let path = write_fixture(
+        &docs_dir,
+        "a.txt",
+        "*a.txt* file\n\n==============================================================================\nS *a-sec*\n\nfirst-body-term\n",
+    );
+    let idx = tmp.path().join("idx");
+    let pattern = format!("{}/*.txt", docs_dir.display());
+
+    bin()
+        .args(["build", "--docs", &pattern, "--out"])
+        .arg(&idx)
+        .assert()
+        .success();
+
+    // Rewrite the file with a new body term + touch the mtime so
+    // (mtime, size) both change and incremental flags it.
+    std::fs::write(
+        &path,
+        "*a.txt* file\n\n==============================================================================\nS *a-sec*\n\nsecond-body-term-different-length\n",
+    )
+    .unwrap();
+    touch_file(&path);
+
+    bin()
+        .args(["build", "--incremental", "--docs", &pattern, "--out"])
+        .arg(&idx)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed:   1"));
+
+    // Old term is gone; new term is searchable.
+    bin()
+        .args(["search", "--index"])
+        .arg(&idx)
+        .arg("first-body-term")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no hits"));
+    bin()
+        .args(["search", "--index"])
+        .arg(&idx)
+        .arg("second-body-term-different-length")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1. a-sec"));
+}
+
+#[test]
+fn incremental_detects_new_file_and_indexes_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs_dir = tmp.path().join("docs");
+    std::fs::create_dir(&docs_dir).unwrap();
+    write_fixture(
+        &docs_dir,
+        "a.txt",
+        "*a.txt* file\n\n==============================================================================\nS *a-sec*\n\nalpha-body\n",
+    );
+    let idx = tmp.path().join("idx");
+    let pattern = format!("{}/*.txt", docs_dir.display());
+
+    bin()
+        .args(["build", "--docs", &pattern, "--out"])
+        .arg(&idx)
+        .assert()
+        .success();
+
+    // Add a second file to the corpus.
+    write_fixture(
+        &docs_dir,
+        "b.txt",
+        "*b.txt* file\n\n==============================================================================\nS *b-sec*\n\nbrand-new-beta-body\n",
+    );
+
+    bin()
+        .args(["build", "--incremental", "--docs", &pattern, "--out"])
+        .arg(&idx)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("new:       1"));
+
+    bin()
+        .args(["search", "--index"])
+        .arg(&idx)
+        .arg("brand-new-beta-body")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1. b-sec"));
+}
+
+#[test]
+fn incremental_detects_removed_file_and_drops_it_from_the_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs_dir = tmp.path().join("docs");
+    std::fs::create_dir(&docs_dir).unwrap();
+    write_fixture(
+        &docs_dir,
+        "a.txt",
+        "*a.txt* file\n\n==============================================================================\nS *a-sec*\n\nkept-body\n",
+    );
+    let doomed = write_fixture(
+        &docs_dir,
+        "gone.txt",
+        "*gone.txt* file\n\n==============================================================================\nS *gone-sec*\n\ndoomed-body-term\n",
+    );
+    let idx = tmp.path().join("idx");
+    let pattern = format!("{}/*.txt", docs_dir.display());
+
+    bin()
+        .args(["build", "--docs", &pattern, "--out"])
+        .arg(&idx)
+        .assert()
+        .success();
+
+    // Delete the file from the corpus.
+    std::fs::remove_file(&doomed).unwrap();
+
+    bin()
+        .args(["build", "--incremental", "--docs", &pattern, "--out"])
+        .arg(&idx)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed:   1"));
+
+    // The removed doc's body term no longer surfaces.
+    bin()
+        .args(["search", "--index"])
+        .arg(&idx)
+        .arg("doomed-body-term")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no hits"));
+}

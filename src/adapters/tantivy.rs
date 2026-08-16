@@ -6,16 +6,18 @@
 //! `:help`.
 //!
 //! Schema fields:
-//!   - `doc_path`   STRING + STORED — exact-match filter + hit attribution
-//!   - `header`     TEXT   + STORED — tokenized so partial header words match
-//!   - `tags`       TEXT   + STORED — tokenized; user's query often looks like a tag word
-//!   - `body`       TEXT   + STORED — the primary search target
-//!   - `line_start` U64    + STORED — 1-indexed line for cursor-precise jumps
+//! - `doc_path` (STRING + STORED) — exact-match filter and hit attribution.
+//!   STRING (raw tokenizer) matters — the `update` path uses
+//!   `Term::from_field_text(doc_path, ...)` to delete every section for a
+//!   source file, which only works if the field is stored verbatim.
+//! - `header` (TEXT + STORED) — tokenized so partial header words match.
+//! - `tags` (TEXT + STORED) — tokenized; user's query often looks like a tag word.
+//! - `body` (TEXT + STORED) — the primary search target.
+//! - `line_start` (U64 + STORED) — 1-indexed line for cursor-precise jumps.
 //!
-//! No `--incremental` support yet; `build_from` is single-shot. Callers who
-//! need incremental (per the TODO follow-up) will grow a persistent
-//! IndexWriter handle. Kept simple here because the CLI's `build` command
-//! is inherently one-shot.
+//! Two entry points:
+//!   - `build_from` for full (re)build — single-shot; wipes the target dir.
+//!   - `update` for incremental — deletes-by-doc-path + adds; all one commit.
 
 use crate::domain::{Document, Query, SearchHit};
 use std::path::{Path, PathBuf};
@@ -23,7 +25,7 @@ use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value};
 use tantivy::snippet::SnippetGenerator;
-use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument, doc};
+use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument, Term, doc};
 
 /// Default writer heap. 50 MB is tantivy's suggested minimum; vimdoc corpora
 /// are tiny (single-digit MB total) so this is overkill and fast.
@@ -128,6 +130,43 @@ impl TantivyIndex {
         for document in docs {
             add_document(&mut writer, &fields, &document)?;
         }
+        writer.commit()?;
+        Ok(())
+    }
+
+    /// Incrementally update an existing index. `removed_paths` and
+    /// `changed_docs` both trigger a `delete_term` on `doc_path` — the
+    /// first because the file left the corpus, the second because its
+    /// sections have been re-parsed and the old versions must not linger.
+    /// `new_docs` are added without a preceding delete (nothing to remove).
+    ///
+    /// Everything runs in one writer session with one commit at the end,
+    /// so the update is atomic from a reader's perspective.
+    pub fn update(
+        &self,
+        removed_paths: &[PathBuf],
+        changed_docs: Vec<Document>,
+        new_docs: Vec<Document>,
+    ) -> Result<(), IndexError> {
+        let mut writer: IndexWriter = self.index.writer(WRITER_HEAP_BYTES)?;
+
+        // delete_term operates on tantivy Terms, which are (field, text)
+        // pairs. Our doc_path field is STRING (raw tokenizer) so a Term
+        // built from the exact path string matches every section indexed
+        // under that path.
+        for path in removed_paths {
+            let term = Term::from_field_text(self.fields.doc_path, &path.display().to_string());
+            writer.delete_term(term);
+        }
+        for doc in &changed_docs {
+            let term = Term::from_field_text(self.fields.doc_path, &doc.path.display().to_string());
+            writer.delete_term(term);
+        }
+
+        for document in changed_docs.into_iter().chain(new_docs) {
+            add_document(&mut writer, &self.fields, &document)?;
+        }
+
         writer.commit()?;
         Ok(())
     }
@@ -489,6 +528,157 @@ mod tests {
         assert!(
             !tmp.path().join("stale.txt").exists(),
             "build_from must clear pre-existing files"
+        );
+    }
+
+    // -- update() incremental API ---------------------------------------
+
+    #[test]
+    fn update_with_removed_paths_drops_hits_for_those_docs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = sample_doc(
+            "doc/a.txt",
+            vec![section("A", vec!["a-tag"], "alpha term here", 1)],
+        );
+        let b = sample_doc(
+            "doc/b.txt",
+            vec![section("B", vec!["b-tag"], "beta term here", 1)],
+        );
+        TantivyIndex::build_from(tmp.path(), vec![a, b]).unwrap();
+
+        let idx = TantivyIndex::open(tmp.path()).unwrap();
+        idx.update(&[PathBuf::from("doc/a.txt")], vec![], vec![])
+            .unwrap();
+
+        // Reopen so the reader sees the post-commit state (ReloadPolicy
+        // handles this on later calls, but a fresh handle is clearer in a
+        // test).
+        let idx = TantivyIndex::open(tmp.path()).unwrap();
+        let hits = idx.search(&Query::new("term", 10).unwrap()).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].document, PathBuf::from("doc/b.txt"));
+    }
+
+    #[test]
+    fn update_with_changed_docs_replaces_prior_sections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_a = sample_doc(
+            "doc/a.txt",
+            vec![section("Old", vec!["a-old"], "ancient content", 1)],
+        );
+        TantivyIndex::build_from(tmp.path(), vec![old_a]).unwrap();
+
+        // Same path, new content.
+        let new_a = sample_doc(
+            "doc/a.txt",
+            vec![section("New", vec!["a-new"], "modern content", 1)],
+        );
+        let idx = TantivyIndex::open(tmp.path()).unwrap();
+        idx.update(&[], vec![new_a], vec![]).unwrap();
+
+        let idx = TantivyIndex::open(tmp.path()).unwrap();
+        // Old term is gone.
+        assert!(
+            idx.search(&Query::new("ancient", 10).unwrap())
+                .unwrap()
+                .is_empty(),
+            "old section must be deleted, not just shadowed"
+        );
+        // New term is present.
+        let hits = idx.search(&Query::new("modern", 10).unwrap()).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn update_with_new_docs_adds_them_without_touching_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = sample_doc(
+            "doc/a.txt",
+            vec![section("A", vec!["a-tag"], "alpha content", 1)],
+        );
+        TantivyIndex::build_from(tmp.path(), vec![a]).unwrap();
+
+        let b = sample_doc(
+            "doc/b.txt",
+            vec![section("B", vec!["b-tag"], "beta content", 1)],
+        );
+        let idx = TantivyIndex::open(tmp.path()).unwrap();
+        idx.update(&[], vec![], vec![b]).unwrap();
+
+        let idx = TantivyIndex::open(tmp.path()).unwrap();
+        // Both are searchable now.
+        assert_eq!(
+            idx.search(&Query::new("alpha", 10).unwrap()).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            idx.search(&Query::new("beta", 10).unwrap()).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn update_atomic_mix_of_removed_changed_new() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = sample_doc(
+            "doc/a.txt",
+            vec![section("A", vec!["a-tag"], "keeping-alpha", 1)],
+        );
+        let b = sample_doc(
+            "doc/b.txt",
+            vec![section("B", vec!["b-tag"], "changing-beta", 1)],
+        );
+        let c = sample_doc(
+            "doc/c.txt",
+            vec![section("C", vec!["c-tag"], "leaving-gamma", 1)],
+        );
+        TantivyIndex::build_from(tmp.path(), vec![a, b, c]).unwrap();
+
+        let updated_b = sample_doc(
+            "doc/b.txt",
+            vec![section("B'", vec!["b-tag"], "renewed-beta", 1)],
+        );
+        let d = sample_doc(
+            "doc/d.txt",
+            vec![section("D", vec!["d-tag"], "arriving-delta", 1)],
+        );
+
+        let idx = TantivyIndex::open(tmp.path()).unwrap();
+        idx.update(&[PathBuf::from("doc/c.txt")], vec![updated_b], vec![d])
+            .unwrap();
+
+        let idx = TantivyIndex::open(tmp.path()).unwrap();
+        // a: kept
+        assert_eq!(
+            idx.search(&Query::new("keeping-alpha", 10).unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+        // b: old gone, new in
+        assert!(
+            idx.search(&Query::new("changing-beta", 10).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            idx.search(&Query::new("renewed-beta", 10).unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+        // c: removed
+        assert!(
+            idx.search(&Query::new("leaving-gamma", 10).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        // d: added
+        assert_eq!(
+            idx.search(&Query::new("arriving-delta", 10).unwrap())
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

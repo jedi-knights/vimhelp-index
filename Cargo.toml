@@ -33,6 +33,10 @@ assert_cmd = "2"
 predicates = "3"
 # scratch directories for fixture-driven parser tests
 tempfile = "3"
+# deterministic mtime bumps in CLI e2e tests — HFS+ rounds to whole seconds,
+# so a plain `std::fs::write` between two build calls doesn't reliably move
+# mtime in the same test run.
+filetime = "0.2"
 
 [[bin]]
 name = "vimhelp-index"
