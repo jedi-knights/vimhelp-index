@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value};
+use tantivy::snippet::SnippetGenerator;
 use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument, doc};
 
 /// Default writer heap. 50 MB is tantivy's suggested minimum; vimdoc corpora
@@ -32,6 +33,11 @@ const WRITER_HEAP_BYTES: usize = 50_000_000;
 /// decide" sentinel domain::Query documents). Chosen to fit a picker page
 /// without truncation being surprising.
 const DEFAULT_MAX_HITS: usize = 50;
+
+/// Max chars in a snippet fragment (SnippetGenerator) and in the fallback
+/// truncation. 240 balances "you can see the match in context" against
+/// "still fits in a picker line without wrapping horribly."
+const SNIPPET_MAX_CHARS: usize = 240;
 
 /// Errors from the tantivy adapter. `Tantivy` wraps engine errors; `Io`
 /// covers directory creation and pathing. Kept thin — tantivy's own error
@@ -168,10 +174,17 @@ impl TantivyIndex {
         };
         let top = searcher.search(&parsed, &TopDocs::with_limit(limit))?;
 
+        // SnippetGenerator picks an excerpt from the body field centered on
+        // the matched term(s). Built once per query — the setup cost is
+        // non-trivial and reusing across hits is the whole point.
+        let mut snippet_gen = SnippetGenerator::create(&searcher, &*parsed, self.fields.body)?;
+        snippet_gen.set_max_num_chars(SNIPPET_MAX_CHARS);
+
         let mut hits = Vec::with_capacity(top.len());
         for (score, addr) in top {
             let doc: TantivyDocument = searcher.doc(addr)?;
-            hits.push(shape_hit(&doc, &self.fields, score));
+            let snippet_fragment = snippet_gen.snippet_from_doc(&doc).fragment().to_string();
+            hits.push(shape_hit(&doc, &self.fields, score, snippet_fragment));
         }
         Ok(hits)
     }
@@ -199,7 +212,17 @@ fn add_document(
 }
 
 /// Read one stored tantivy doc back into a domain SearchHit.
-fn shape_hit(doc: &TantivyDocument, fields: &Fields, score: f32) -> SearchHit {
+///
+/// `snippet_fragment` comes from SnippetGenerator — non-empty when the
+/// query matched inside the body field, empty when the match was in tags
+/// or header only. The empty case falls back to the first N chars of the
+/// body so hits still have some context to render.
+fn shape_hit(
+    doc: &TantivyDocument,
+    fields: &Fields,
+    score: f32,
+    snippet_fragment: String,
+) -> SearchHit {
     let doc_path = first_text(doc, fields.doc_path).unwrap_or_default();
     let header = first_text(doc, fields.header).filter(|s| !s.is_empty());
     let body = first_text(doc, fields.body).unwrap_or_default();
@@ -214,12 +237,14 @@ fn shape_hit(doc: &TantivyDocument, fields: &Fields, score: f32) -> SearchHit {
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty());
 
-    // Snippet: first 240 chars of the body. Later PRs can plug in
-    // tantivy::snippet::SnippetGenerator for highlighted excerpts.
-    let snippet = if body.len() > 240 {
-        format!("{}…", &body[..240])
+    let snippet = if snippet_fragment.is_empty() {
+        // No body-field match — fall back to a bounded body excerpt so the
+        // hit still has renderable context (typical when the query hit a
+        // tag or header only). char-based truncation so we don't slice a
+        // multibyte codepoint in half.
+        truncate_ellipsis(&body, SNIPPET_MAX_CHARS)
     } else {
-        body
+        snippet_fragment
     };
 
     SearchHit {
@@ -239,6 +264,19 @@ fn first_text(doc: &TantivyDocument, field: Field) -> Option<String> {
 
 fn first_u64(doc: &TantivyDocument, field: Field) -> Option<u64> {
     doc.get_first(field).and_then(|v| v.as_u64())
+}
+
+/// Truncate `s` to at most `max_chars` Unicode code points, appending
+/// an ellipsis if truncation happened. `char`-based rather than byte-based
+/// so we can't split a multibyte codepoint mid-way.
+fn truncate_ellipsis(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max_chars).collect();
+        out.push('…');
+        out
+    }
 }
 
 #[cfg(test)]
@@ -374,8 +412,12 @@ mod tests {
     }
 
     #[test]
-    fn snippet_truncates_to_240_chars_with_ellipsis() {
-        let long_body = "x".repeat(500) + " floating";
+    fn snippet_centers_on_matched_body_term_and_stays_bounded() {
+        // Long filler either side of the matched word — the snippet should
+        // include "floating" (SnippetGenerator centers on the match) and
+        // stay under the SNIPPET_MAX_CHARS bound rather than dumping the
+        // whole body.
+        let long_body = "x ".repeat(400) + "floating window " + &"y ".repeat(400);
         let tmp = tempfile::tempdir().unwrap();
         let doc = sample_doc("doc/long.txt", vec![section("Long", vec![], &long_body, 1)]);
         TantivyIndex::build_from(tmp.path(), vec![doc]).unwrap();
@@ -383,12 +425,56 @@ mod tests {
         let hits = idx.search(&Query::new("floating", 10).unwrap()).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(
-            hits[0].snippet.ends_with('…'),
-            "snippet should end with ellipsis, got: {}",
+            hits[0].snippet.contains("floating"),
+            "snippet should center on the matched term, got: {}",
             hits[0].snippet
         );
-        // 240 body chars + 1 ellipsis char (3 bytes for the … codepoint).
-        assert_eq!(hits[0].snippet.chars().count(), 241);
+        assert!(
+            hits[0].snippet.chars().count() <= SNIPPET_MAX_CHARS,
+            "snippet should stay within SNIPPET_MAX_CHARS ({}), got {}: {}",
+            SNIPPET_MAX_CHARS,
+            hits[0].snippet.chars().count(),
+            hits[0].snippet,
+        );
+    }
+
+    #[test]
+    fn snippet_falls_back_to_body_truncation_when_only_tag_matches() {
+        // Match hits the tag field; body is unrelated content. SnippetGenerator
+        // has no body term to center on, so we fall back to the first-N body
+        // truncation so the hit still has renderable context.
+        let long_body = "unrelated body content ".repeat(50); // > SNIPPET_MAX_CHARS
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = sample_doc(
+            "doc/tag-only.txt",
+            vec![section("Header", vec!["special-tag-token"], &long_body, 1)],
+        );
+        TantivyIndex::build_from(tmp.path(), vec![doc]).unwrap();
+        let idx = TantivyIndex::open(tmp.path()).unwrap();
+        let hits = idx
+            .search(&Query::new("special-tag-token", 10).unwrap())
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].snippet.ends_with('…'),
+            "fallback snippet should end with an ellipsis when body was longer than the cap, got: {}",
+            hits[0].snippet
+        );
+        assert!(
+            hits[0].snippet.chars().count() == SNIPPET_MAX_CHARS + 1,
+            "fallback snippet should be exactly SNIPPET_MAX_CHARS + ellipsis, got {} chars",
+            hits[0].snippet.chars().count(),
+        );
+    }
+
+    #[test]
+    fn truncate_ellipsis_is_char_boundary_safe() {
+        // Multibyte codepoints would panic under naive byte slicing.
+        let s = "abcé漢字def"; // 9 chars, mixed 1/2/3-byte
+        assert_eq!(s.chars().count(), 9);
+        assert_eq!(truncate_ellipsis(s, 20), s.to_string()); // room to spare
+        assert_eq!(truncate_ellipsis(s, 5), "abcé漢…"); // mid-multibyte cut
+        assert_eq!(truncate_ellipsis(s, 9), s.to_string()); // exact fit — no ellipsis
     }
 
     #[test]
