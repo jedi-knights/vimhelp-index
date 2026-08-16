@@ -2,19 +2,27 @@
 //!
 //! Two subcommands:
 //!
-//! - `build` — walk a glob of vimdoc files and produce a full-text index at
-//!   the given output path. The index format is opaque to the CLI; the
-//!   adapter that owns it (tantivy, in a follow-up) decides shape.
-//! - `search` — open the index at `--index=<path>` and answer a query,
-//!   printing hits ranked by score.
+//! - `build` — resolve a glob of `doc/*.txt` files, parse each, and write
+//!   a fresh tantivy index at `--out`.
+//! - `search` — open a previously-built index and print hits ranked by
+//!   score. `--format=console` (default) or `--format=json`.
 //!
-//! On this PR both subcommands validate args and return a "not yet
-//! implemented" error — the parser and search-engine adapters land next.
-//! The e2e tests below anchor the CLI *shape* so downstream implementation
-//! PRs can slot into stable exit codes and error messages.
+//! Dispatch below is thin — each subcommand's real implementation lives in
+//! its own module (build.rs / search.rs) so this file stays about
+//! argument shape and nothing else.
+//!
+//! Note: CLI end-to-end tests live in `tests/cli.rs`, not here — the
+//! `assert_cmd::Command::cargo_bin("...")` helper reads `CARGO_BIN_EXE_*`
+//! which is only populated for integration-position tests. A
+//! src/-position unit test runs against a stale `target/debug/` binary
+//! because the harness doesn't wire cargo_bin to a rebuild trigger.
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::str::FromStr;
+
+mod build;
+mod search;
 
 /// Full-text index and search over vimdoc.
 #[derive(Parser, Debug)]
@@ -47,6 +55,9 @@ enum Command {
         /// Zero means the searcher's default; not "unbounded".
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Output format: `console` (default) or `json`.
+        #[arg(long, default_value = "console")]
+        format: String,
         /// The query text. Wrap in quotes for multi-word queries.
         query: String,
     },
@@ -56,39 +67,15 @@ enum Command {
 pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Build { docs, out } => run_build(&docs, &out),
+        Command::Build { docs, out } => build::run(&docs, &out),
         Command::Search {
             index,
             limit,
+            format,
             query,
-        } => run_search(&index, limit, &query),
+        } => {
+            let fmt = search::OutputFormat::from_str(&format)?;
+            search::run(&index, &query, limit, fmt)
+        }
     }
 }
-
-fn run_build(docs: &str, out: &std::path::Path) -> anyhow::Result<()> {
-    // Placeholder body — feat(parser) + feat(indexer) fill this in.
-    // The message shape is stable so downstream implementations only
-    // need to swap the body, not the surrounding CLI plumbing.
-    Err(anyhow::anyhow!(
-        "build not yet implemented (docs='{}', out='{}')",
-        docs,
-        out.display()
-    ))
-}
-
-fn run_search(index: &std::path::Path, limit: usize, query: &str) -> anyhow::Result<()> {
-    let _ = crate::domain::Query::new(query, limit)?;
-    Err(anyhow::anyhow!(
-        "search not yet implemented (index='{}', limit={}, query='{}')",
-        index.display(),
-        limit,
-        query
-    ))
-}
-
-// CLI end-to-end tests live in tests/cli.rs (an integration test), NOT here.
-// A `cargo test` from within src/cli/mod.rs runs as a library unit test — the
-// test harness does not rebuild the binary and CARGO_BIN_EXE_* is unset, so
-// assert_cmd's cargo_bin() picks up whatever stale binary is already at
-// target/debug/. Placing the tests under tests/ makes cargo treat them as
-// binary integration tests and rebuild the bin dep on demand.
