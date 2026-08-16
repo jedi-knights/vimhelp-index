@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target
+
+# Cargo lock — commit for binaries (this is a bin crate), so intentionally NOT ignored
+# (leaving this note for future readers who might reflexively add Cargo.lock)
+
+# insta pending snapshots — reviewed and either accepted or rejected
+**/*.snap.new
+
+# Session-local task tracker
+TODO.md
+
+# Editor state
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store

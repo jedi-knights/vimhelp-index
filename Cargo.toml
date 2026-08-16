@@ -1,0 +1,37 @@
+[package]
+name = "vimhelp-index"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Full-text index and search over vimdoc (:h)"
+license = "MIT"
+repository = "https://github.com/jedi-knights/vimhelp-index"
+
+[dependencies]
+# CLI + args
+clap = { version = "4.5", features = ["derive"] }
+# error handling — anyhow at the binary boundary, thiserror in domain
+anyhow = "1"
+thiserror = "2"
+# serde for future JSON output shape
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# glob resolves the --docs pattern the user supplies
+glob = "0.3"
+
+[dev-dependencies]
+# snapshot tests for the parser output shape
+insta = { version = "1.40", features = ["json"] }
+# end-to-end CLI tests
+assert_cmd = "2"
+predicates = "3"
+# scratch directories for fixture-driven parser tests
+tempfile = "3"
+
+[[bin]]
+name = "vimhelp-index"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
