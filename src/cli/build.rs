@@ -1,5 +1,5 @@
-//! `build` subcommand — resolve a glob of vimdoc files, parse each, and
-//! write a tantivy index at `--out`.
+//! `build` subcommand — resolve one or more globs of vimdoc files, parse
+//! each, and write a tantivy index at `--out`.
 //!
 //! Two modes:
 //!
@@ -9,6 +9,13 @@
 //!   new/changed/removed/unchanged, and only re-indexes the changed +
 //!   new subset. If the manifest is absent or on a different version,
 //!   falls back to a full rebuild.
+//!
+//! `--docs` is repeatable — every occurrence adds one glob, and the
+//! union of resolved paths (sorted + deduplicated) becomes the corpus.
+//! Individual globs that match zero files are silently ignored; only
+//! an empty union is an error. This handles the LazyVim shape where
+//! `plugins/*/doc/*.txt` sits alongside `$VIMRUNTIME/doc/*.txt` and
+//! the plugin dir may be empty on a fresh install.
 
 use crate::adapters::manifest::{self, FileState, Manifest, ManifestDiff};
 use crate::adapters::parser::vimdoc;
@@ -18,12 +25,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Execute the `build` subcommand.
-pub fn run(docs_glob: &str, out_dir: &Path, incremental: bool) -> anyhow::Result<()> {
-    let paths = resolve_glob(docs_glob)?;
+pub fn run(docs_globs: &[String], out_dir: &Path, incremental: bool) -> anyhow::Result<()> {
+    let paths = resolve_globs(docs_globs)?;
     if paths.is_empty() {
         anyhow::bail!(
-            "no files matched --docs pattern {:?} — glob resolved to zero paths",
-            docs_glob
+            "no files matched any --docs pattern (checked {} glob(s): {:?})",
+            docs_globs.len(),
+            docs_globs
         );
     }
 
@@ -126,10 +134,10 @@ fn print_incremental_summary(out_dir: &Path, diff: &ManifestDiff) {
     println!("  unchanged: {}", diff.unchanged.len());
 }
 
-/// Resolve the caller's --docs pattern to a sorted, deduplicated list of
-/// concrete file paths. Sorted so build output is deterministic across
-/// filesystems that walk in different orders.
-fn resolve_glob(pattern: &str) -> anyhow::Result<Vec<std::path::PathBuf>> {
+/// Resolve one --docs glob to a list of concrete file paths.
+/// Directories that happen to match the glob are silently skipped;
+/// per-entry errors (e.g. permission denied) propagate.
+fn resolve_glob(pattern: &str) -> anyhow::Result<Vec<PathBuf>> {
     let entries = glob::glob(pattern)
         .map_err(|e| anyhow::anyhow!("invalid --docs pattern {pattern:?}: {e}"))?;
     let mut out = Vec::new();
@@ -139,6 +147,22 @@ fn resolve_glob(pattern: &str) -> anyhow::Result<Vec<std::path::PathBuf>> {
             Ok(_) => {} // skip directories that happen to match the glob
             Err(e) => return Err(anyhow::anyhow!("reading glob entry: {e}")),
         }
+    }
+    Ok(out)
+}
+
+/// Resolve every --docs pattern and union the results into a single
+/// sorted + deduplicated path list. Sorting keeps build output stable
+/// across filesystems that walk in different orders; deduplication
+/// handles overlapping globs (`a/*.txt` + `a/foo.txt`).
+///
+/// Invalid glob syntax on any pattern fails the whole call. Empty
+/// individual globs (zero matches) are silently ignored — the caller
+/// (`run`) surfaces the "empty union" error message.
+fn resolve_globs(patterns: &[String]) -> anyhow::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for pattern in patterns {
+        out.extend(resolve_glob(pattern)?);
     }
     out.sort();
     out.dedup();
@@ -150,13 +174,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_glob_returns_sorted_deduped_files() {
+    fn resolve_globs_returns_sorted_deduped_files_for_a_single_glob() {
         let tmp = tempfile::tempdir().unwrap();
         for name in ["b.txt", "a.txt", "c.txt"] {
             std::fs::write(tmp.path().join(name), b"body\n").unwrap();
         }
         let pattern = format!("{}/*.txt", tmp.path().display());
-        let paths = resolve_glob(&pattern).unwrap();
+        let paths = resolve_globs(&[pattern]).unwrap();
         let names: Vec<_> = paths
             .iter()
             .map(|p| p.file_name().unwrap().to_str().unwrap())
@@ -165,21 +189,82 @@ mod tests {
     }
 
     #[test]
-    fn resolve_glob_ignores_directories() {
+    fn resolve_globs_ignores_directories() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("real.txt"), b"body").unwrap();
         std::fs::create_dir(tmp.path().join("dir.txt")).unwrap(); // matches *.txt as a dir
         let pattern = format!("{}/*.txt", tmp.path().display());
-        let paths = resolve_glob(&pattern).unwrap();
+        let paths = resolve_globs(&[pattern]).unwrap();
         assert_eq!(paths.len(), 1);
         assert!(paths[0].ends_with("real.txt"));
     }
 
     #[test]
-    fn build_errors_when_glob_matches_nothing() {
+    fn resolve_globs_unions_results_across_multiple_patterns() {
         let tmp = tempfile::tempdir().unwrap();
-        let pattern = format!("{}/*.nonexistent", tmp.path().display());
-        let err = run(&pattern, tmp.path(), false).unwrap_err();
-        assert!(err.to_string().contains("no files matched"));
+        let dir_a = tmp.path().join("a");
+        let dir_b = tmp.path().join("b");
+        std::fs::create_dir(&dir_a).unwrap();
+        std::fs::create_dir(&dir_b).unwrap();
+        std::fs::write(dir_a.join("one.txt"), b"1").unwrap();
+        std::fs::write(dir_a.join("two.txt"), b"2").unwrap();
+        std::fs::write(dir_b.join("three.txt"), b"3").unwrap();
+
+        let paths = resolve_globs(&[
+            format!("{}/*.txt", dir_a.display()),
+            format!("{}/*.txt", dir_b.display()),
+        ])
+        .unwrap();
+
+        // Sort is by FULL path (grouped by directory: a/ before b/, then
+        // filename within each dir), not just filename.
+        let names: Vec<_> = paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["one.txt", "two.txt", "three.txt"]);
+    }
+
+    #[test]
+    fn resolve_globs_deduplicates_files_matched_by_overlapping_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("shared.txt"), b"body").unwrap();
+        // Same file resolved by two different globs. Union must dedup.
+        let paths = resolve_globs(&[
+            format!("{}/*.txt", tmp.path().display()),
+            format!("{}/shared.txt", tmp.path().display()),
+        ])
+        .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("shared.txt"));
+    }
+
+    #[test]
+    fn resolve_globs_silently_accepts_individual_zero_match_globs() {
+        // Real world: `plugins/*/doc/*.txt` on a fresh install matches
+        // nothing, but the user also passed `$VIMRUNTIME/doc/*.txt` which
+        // does. The empty individual glob must not error — only an empty
+        // UNION should.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("real.txt"), b"body").unwrap();
+        let paths = resolve_globs(&[
+            format!("{}/no-such-dir/*.txt", tmp.path().display()),
+            format!("{}/*.txt", tmp.path().display()),
+        ])
+        .unwrap();
+        assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn build_errors_when_all_globs_match_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = format!("{}/*.nonexistent-a", tmp.path().display());
+        let b = format!("{}/*.nonexistent-b", tmp.path().display());
+        let err = run(&[a, b], tmp.path(), false).unwrap_err();
+        let msg = err.to_string();
+        // Message names the glob count so users see how many patterns were
+        // tried; helpful when a multi-glob build produces a surprise empty.
+        assert!(msg.contains("no files matched"));
+        assert!(msg.contains("2 glob"));
     }
 }

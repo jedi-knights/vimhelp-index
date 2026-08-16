@@ -67,12 +67,27 @@ Install-only composite action — no opinionated defaults. Callers write their o
 
 ## Usage
 
-### `build` — index a glob of vimdoc files
+### `build` — index one or more globs of vimdoc files
 
 ```sh
 vimhelp-index build --docs='/path/to/**/doc/*.txt' --out=./index
 vimhelp-index build --docs='/path/to/**/doc/*.txt' --out=./index --incremental
 ```
+
+`--docs` is **repeatable** — pass it once per glob and the union of
+all resolved paths (sorted, deduplicated) becomes the corpus:
+
+```sh
+vimhelp-index build \
+  --docs="$VIMRUNTIME/doc/*.txt" \
+  --docs="$HOME/.local/share/nvim/lazy/*/doc/*.txt" \
+  --out=./index
+```
+
+Individual globs that match zero files are silently ignored — only an
+empty union across all `--docs` flags errors. This handles the common
+"forward-looking glob" shape (`plugins/*/doc/*.txt` on a fresh install
+before any plugins are added) alongside a matching one.
 
 `--incremental` only re-indexes files that changed since the last build
 (detected via mtime + size, stored in `<out>/vimhelp-manifest.json`).

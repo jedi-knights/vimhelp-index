@@ -111,6 +111,101 @@ fn build_indexes_files_and_prints_summary() {
     );
 }
 
+#[test]
+fn build_unions_files_across_multiple_docs_flags() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir_a = tmp.path().join("a");
+    let dir_b = tmp.path().join("b");
+    std::fs::create_dir(&dir_a).unwrap();
+    std::fs::create_dir(&dir_b).unwrap();
+    write_fixture(
+        &dir_a,
+        "alpha.txt",
+        "*alpha.txt* alpha\n\n==============================================================================\nSection A *alpha-sec*\n\nalpha content\n",
+    );
+    write_fixture(
+        &dir_b,
+        "beta.txt",
+        "*beta.txt* beta\n\n==============================================================================\nSection B *beta-sec*\n\nbeta content\n",
+    );
+
+    let idx = tmp.path().join("idx");
+    let glob_a = format!("{}/*.txt", dir_a.display());
+    let glob_b = format!("{}/*.txt", dir_b.display());
+
+    bin()
+        .args(["build", "--docs", &glob_a, "--docs", &glob_b, "--out"])
+        .arg(&idx)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2 file(s)"));
+
+    // Both docs are searchable from the same index.
+    bin()
+        .args(["search", "--index"])
+        .arg(&idx)
+        .arg("alpha")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("alpha-sec"));
+    bin()
+        .args(["search", "--index"])
+        .arg(&idx)
+        .arg("beta")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("beta-sec"));
+}
+
+#[test]
+fn build_silently_accepts_individual_zero_match_glob_alongside_a_matching_one() {
+    // Real-world shape: `plugins/*/doc/*.txt` matches nothing on a fresh
+    // install, but `$VIMRUNTIME/doc/*.txt` does. Build must succeed with
+    // just the matching glob's files — not error on the empty individual
+    // glob.
+    let tmp = tempfile::tempdir().unwrap();
+    let docs_dir = tmp.path().join("docs");
+    std::fs::create_dir(&docs_dir).unwrap();
+    write_fixture(
+        &docs_dir,
+        "a.txt",
+        "*a.txt* file\n\n==============================================================================\nS *a-sec*\n\ncontent\n",
+    );
+    let missing_glob = format!("{}/does-not-exist/*.txt", tmp.path().display());
+    let real_glob = format!("{}/*.txt", docs_dir.display());
+    let idx = tmp.path().join("idx");
+
+    bin()
+        .args([
+            "build",
+            "--docs",
+            &missing_glob,
+            "--docs",
+            &real_glob,
+            "--out",
+        ])
+        .arg(&idx)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 file(s)"));
+}
+
+#[test]
+fn build_errors_when_all_docs_globs_match_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = format!("{}/*.nonexistent-a", tmp.path().display());
+    let b = format!("{}/*.nonexistent-b", tmp.path().display());
+    let idx = tmp.path().join("idx");
+    bin()
+        .args(["build", "--docs", &a, "--docs", &b, "--out"])
+        .arg(&idx)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no files matched"))
+        // Names the count so users see how many patterns were tried.
+        .stderr(predicate::str::contains("2 glob"));
+}
+
 // -- search behaviour ---------------------------------------------------
 
 /// Build a small index into a tempdir and return its path (kept alive by
