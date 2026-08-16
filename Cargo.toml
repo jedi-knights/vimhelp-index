@@ -18,6 +18,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # glob resolves the --docs pattern the user supplies
 glob = "0.3"
+# regex — vimdoc tag extraction: *name* with a bounded character class
+regex = "1"
 
 [dev-dependencies]
 # snapshot tests for the parser output shape
