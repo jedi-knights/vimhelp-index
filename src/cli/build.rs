@@ -1,13 +1,24 @@
 //! `build` subcommand — resolve a glob of vimdoc files, parse each, and
-//! write a fresh tantivy index at `--out`.
+//! write a tantivy index at `--out`.
+//!
+//! Two modes:
+//!
+//! - **Full** (default): wipes `--out` and rebuilds from scratch.
+//! - **Incremental** (`--incremental`): reads the manifest at
+//!   `<out>/vimhelp-manifest.json`, classifies each current file as
+//!   new/changed/removed/unchanged, and only re-indexes the changed +
+//!   new subset. If the manifest is absent or on a different version,
+//!   falls back to a full rebuild.
 
+use crate::adapters::manifest::{self, FileState, Manifest, ManifestDiff};
 use crate::adapters::parser::vimdoc;
 use crate::adapters::tantivy::TantivyIndex;
 use crate::domain::Document;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// Execute the `build` subcommand.
-pub fn run(docs_glob: &str, out_dir: &Path) -> anyhow::Result<()> {
+pub fn run(docs_glob: &str, out_dir: &Path, incremental: bool) -> anyhow::Result<()> {
     let paths = resolve_glob(docs_glob)?;
     if paths.is_empty() {
         anyhow::bail!(
@@ -16,6 +27,29 @@ pub fn run(docs_glob: &str, out_dir: &Path) -> anyhow::Result<()> {
         );
     }
 
+    let current_states = manifest::stat_all(&paths)?;
+
+    if incremental {
+        let prior = Manifest::load(out_dir)?;
+        if let Some(prior) = prior {
+            return run_incremental(&current_states, prior, out_dir);
+        }
+        // No usable manifest — full build. Report so users understand
+        // why the first --incremental after a wipe took full-build time.
+        println!(
+            "no prior manifest at {} — running full build",
+            out_dir.display()
+        );
+    }
+
+    run_full(paths, current_states, out_dir)
+}
+
+fn run_full(
+    paths: Vec<PathBuf>,
+    current_states: HashMap<PathBuf, FileState>,
+    out_dir: &Path,
+) -> anyhow::Result<()> {
     let mut docs: Vec<Document> = Vec::with_capacity(paths.len());
     for path in &paths {
         docs.push(vimdoc::parse_file(path)?);
@@ -24,12 +58,72 @@ pub fn run(docs_glob: &str, out_dir: &Path) -> anyhow::Result<()> {
     let section_count: usize = docs.iter().map(|d| d.sections.len()).sum();
     TantivyIndex::build_from(out_dir, docs)?;
 
+    // Manifest is written AFTER build_from because build_from wipes the
+    // directory (including any old manifest) before writing tantivy files.
+    write_manifest(out_dir, current_states)?;
+
     println!(
         "Indexed {section_count} section(s) from {file_count} file(s) → {path}",
         file_count = paths.len(),
         path = out_dir.display()
     );
     Ok(())
+}
+
+fn run_incremental(
+    current_states: &HashMap<PathBuf, FileState>,
+    prior: Manifest,
+    out_dir: &Path,
+) -> anyhow::Result<()> {
+    let diff = manifest::diff(current_states, &prior);
+
+    if diff.is_empty() {
+        println!(
+            "Incremental update at {}: no changes ({} unchanged)",
+            out_dir.display(),
+            diff.unchanged.len()
+        );
+        // No writes at all — the existing manifest is already correct.
+        return Ok(());
+    }
+
+    // Parse changed + new files up front so a parse error rolls back
+    // before we touch the index.
+    let changed_docs = parse_batch(&diff.changed)?;
+    let new_docs = parse_batch(&diff.new)?;
+
+    let idx = TantivyIndex::open(out_dir)?;
+    idx.update(&diff.removed, changed_docs, new_docs)?;
+
+    // Manifest replaced only after commit — if update fails we keep the
+    // prior manifest so a retry sees the same diff.
+    write_manifest(out_dir, current_states.clone())?;
+
+    print_incremental_summary(out_dir, &diff);
+    Ok(())
+}
+
+fn parse_batch(paths: &[PathBuf]) -> anyhow::Result<Vec<Document>> {
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        out.push(vimdoc::parse_file(p)?);
+    }
+    Ok(out)
+}
+
+fn write_manifest(out_dir: &Path, files: HashMap<PathBuf, FileState>) -> anyhow::Result<()> {
+    let mut m = Manifest::new();
+    m.files = files;
+    m.save(out_dir)?;
+    Ok(())
+}
+
+fn print_incremental_summary(out_dir: &Path, diff: &ManifestDiff) {
+    println!("Incremental update at {}:", out_dir.display());
+    println!("  new:       {}", diff.new.len());
+    println!("  changed:   {}", diff.changed.len());
+    println!("  removed:   {}", diff.removed.len());
+    println!("  unchanged: {}", diff.unchanged.len());
 }
 
 /// Resolve the caller's --docs pattern to a sorted, deduplicated list of
@@ -85,7 +179,7 @@ mod tests {
     fn build_errors_when_glob_matches_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let pattern = format!("{}/*.nonexistent", tmp.path().display());
-        let err = run(&pattern, tmp.path()).unwrap_err();
+        let err = run(&pattern, tmp.path(), false).unwrap_err();
         assert!(err.to_string().contains("no files matched"));
     }
 }

@@ -45,6 +45,12 @@ enum Command {
         /// Directory to write the index into. Created if missing.
         #[arg(long, value_name = "DIR")]
         out: PathBuf,
+        /// Re-index only files that changed since the last build.
+        /// Detects change via (mtime, size) recorded in a manifest at
+        /// <out>/vimhelp-manifest.json. Falls back to a full build when
+        /// the manifest is absent or on an incompatible version.
+        #[arg(long)]
+        incremental: bool,
     },
     /// Search a previously-built index.
     Search {
@@ -67,7 +73,11 @@ enum Command {
 pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Build { docs, out } => build::run(&docs, &out),
+        Command::Build {
+            docs,
+            out,
+            incremental,
+        } => build::run(&docs, &out, incremental),
         Command::Search {
             index,
             limit,
