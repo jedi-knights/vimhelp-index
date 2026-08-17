@@ -1,6 +1,6 @@
 [package]
 name = "vimhelp-index"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Full-text index and search over vimdoc (:h)"
@@ -43,5 +43,14 @@ name = "vimhelp-index"
 path = "src/main.rs"
 
 [profile.release]
+lto = "thin"
+codegen-units = 1
+
+# cargo-dist builds release artifacts against this named profile — see
+# .github/workflows/dist.yml. Without it the workflow fails with
+# `error: profile 'dist' is not defined` before touching the compiler,
+# so no binaries get attached to the GitHub Release (observed on v0.0.0).
+[profile.dist]
+inherits = "release"
 lto = "thin"
 codegen-units = 1
